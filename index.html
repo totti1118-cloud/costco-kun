@@ -647,5 +647,148 @@
 })();
 
 </script>
+  
+
+<script>
+
+document.addEventListener("click", async function (event) {
+
+  const button = event.target.closest("#readReceipt");
+
+  if (!button) return;
+
+  event.preventDefault();
+
+  event.stopImmediatePropagation();
+
+  const card = button.closest("div");
+
+  let area = card;
+
+  while (
+
+    area &&
+
+    (!area.querySelector('input[type="file"]') ||
+
+     !area.querySelector("textarea"))
+
+  ) {
+
+    area = area.parentElement;
+
+  }
+
+  if (!area) {
+
+    alert("レシート画像欄を確認できませんでした。");
+
+    return;
+
+  }
+
+  const fileInput = area.querySelector('input[type="file"]');
+
+  const output = area.querySelector("textarea");
+
+  const file = fileInput.files && fileInput.files[0];
+
+  if (!file) {
+
+    alert("先にレシート画像を選択してください。");
+
+    return;
+
+  }
+
+  if (!window.Tesseract) {
+
+    alert("読み取り機能の準備ができていません。ページを再読み込みしてください。");
+
+    return;
+
+  }
+
+  button.disabled = true;
+
+  output.value = "画像を調整して読み取り中です。少しお待ちください。";
+
+  try {
+
+    const image = new Image();
+
+    const imageURL = URL.createObjectURL(file);
+
+    await new Promise((resolve, reject) => {
+
+      image.onload = resolve;
+
+      image.onerror = reject;
+
+      image.src = imageURL;
+
+    });
+
+    const scale = Math.min(
+
+      3,
+
+      Math.max(2, 2400 / image.width)
+
+    );
+
+    const canvas = document.createElement("canvas");
+
+    canvas.width = Math.round(image.width * scale);
+
+    canvas.height = Math.round(image.height * scale);
+
+    const ctx = canvas.getContext("2d");
+
+    ctx.filter = "grayscale(1) contrast(1.6)";
+
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+    URL.revokeObjectURL(imageURL);
+
+    const result = await Tesseract.recognize(
+
+      canvas,
+
+      "jpn+eng",
+
+      { logger: function (m) {
+
+        if (m.status === "recognizing text") {
+
+          output.value =
+
+            "読み取り中… " +
+
+            Math.round((m.progress || 0) * 100) + "%";
+
+        }
+
+      }}
+
+    );
+
+    output.value = result.data.text;
+
+  } catch (error) {
+
+    output.value = "読み取りに失敗しました。画像を選び直してお試しください。";
+
+    console.error(error);
+
+  } finally {
+
+    button.disabled = false;
+
+  }
+
+}, true);
+
+</script>
 </body>
 </html>

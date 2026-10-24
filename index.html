@@ -518,5 +518,134 @@
   });
 })();
 </script>
+  <script>
+
+(function () {
+
+  const page = document.getElementById("page-items");
+
+  if (!page || document.getElementById("receiptReader")) return;
+
+  const box = document.createElement("div");
+
+  box.className = "card";
+
+  box.id = "receiptReader";
+
+  box.innerHTML = `
+
+    <h2>🧾 レシート読み取り</h2>
+
+    <p class="notice">レシート写真を選んで商品名や金額を読み取ります。読み取り結果は確認してから登録してください。</p>
+
+    <input id="receiptPhoto" type="file" accept="image/*" capture="environment">
+
+    <button id="readReceipt" class="btn primary" style="width:100%;margin-top:10px">写真を読み取る</button>
+
+    <p id="receiptStatus" class="notice"></p>
+
+    <div id="receiptOutput"></div>
+
+  `;
+
+  page.insertBefore(box, page.firstChild);
+
+  document.getElementById("readReceipt").addEventListener("click", async function () {
+
+    const file = document.getElementById("receiptPhoto").files[0];
+
+    const status = document.getElementById("receiptStatus");
+
+    const output = document.getElementById("receiptOutput");
+
+    if (!file) {
+
+      status.textContent = "先にレシート写真を選んでください。";
+
+      return;
+
+    }
+
+    this.disabled = true;
+
+    status.textContent = "読み取り準備中です。初回は時間がかかる場合があります。";
+
+    output.replaceChildren();
+
+    try {
+
+      if (!window.Tesseract) {
+
+        await new Promise((resolve, reject) => {
+
+          const s = document.createElement("script");
+
+          s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+
+          s.onload = resolve;
+
+          s.onerror = () => reject(new Error("読み取り機能を読み込めません。通信を確認してください。"));
+
+          document.head.appendChild(s);
+
+        });
+
+      }
+
+      const result = await Tesseract.recognize(file, "jpn+eng", {
+
+        logger: m => {
+
+          if (m.status === "recognizing text") {
+
+            status.textContent = "読み取り中… " + Math.round(m.progress * 100) + "%";
+
+          }
+
+        }
+
+      });
+
+      const text = result.data.text || "";
+
+      const area = document.createElement("textarea");
+
+      area.value = text;
+
+      area.rows = 10;
+
+      area.style.width = "100%";
+
+      area.style.marginTop = "12px";
+
+      area.placeholder = "読み取った文字がここに表示されます";
+
+      output.appendChild(area);
+
+      const note = document.createElement("p");
+
+      note.className = "notice";
+
+      note.textContent = "読み取り結果です。商品名や金額が正しいか確認してください。";
+
+      output.prepend(note);
+
+      status.textContent = "読み取りが完了しました。";
+
+    } catch (e) {
+
+      status.textContent = "エラー：" + e.message;
+
+    } finally {
+
+      this.disabled = false;
+
+    }
+
+  });
+
+})();
+
+</script>
 </body>
 </html>

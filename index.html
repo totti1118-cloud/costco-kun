@@ -78,6 +78,8 @@
     [hidden]{display:none!important}
     button:focus-visible{outline:2px solid var(--accent2);outline-offset:3px}
     @media(max-width:520px){.row{grid-template-columns:1fr}.summarygrid{grid-template-columns:1fr}.hero h1{font-size:30px}}
+
+    .receiptwarn{color:var(--danger);font-weight:700}
   </style>
 </head>
 <body>
@@ -106,6 +108,25 @@
   </section>
 
   <section id="page-items" class="page">
+    <div class="card" id="receiptReader">
+      <h2>🧾 レシート読み取り</h2>
+      <p class="notice">コストコのレシート写真から商品を読み取ります。長いレシートは自動で分割して読み、合計額と照合します。登録前に必ず内容を確認してください。</p>
+      <label for="receiptPhoto">レシート写真</label>
+      <input id="receiptPhoto" type="file" accept="image/*">
+      <label for="receiptPayer">支払った人（読み取った商品すべて）</label>
+      <select id="receiptPayer"></select>
+      <button id="readReceipt" class="btn primary" style="width:100%;margin-top:12px">写真を読み取る</button>
+      <p id="receiptStatus" class="notice" role="status" aria-live="polite"></p>
+      <p id="receiptSummary" class="notice"></p>
+      <div id="receiptCandidates"></div>
+      <button id="registerReceiptBtn" class="btn good" style="width:100%;margin-top:12px;display:none">確認した商品をまとめて登録（負担は全員均等）</button>
+      <details style="margin-top:12px">
+        <summary class="muted">読み取った文字を見る</summary>
+        <textarea id="receiptRawText" rows="10" style="width:100%;margin-top:8px" readonly placeholder="読み取った文字がここに表示されます"></textarea>
+      </details>
+      <p class="notice">コツ：明るい場所で、レシートを伸ばして全体をまっすぐ写すと精度が上がります。影や折れ目は誤読の原因になります。</p>
+    </div>
+
     <div class="card">
       <h2>商品を追加</h2>
       <div class="row">
@@ -247,12 +268,16 @@
   }
 
   function renderPayer(){
-    const p=$("payer"); p.innerHTML="";
-    if(!state.members.length){
-      const o=document.createElement("option"); o.textContent="参加者を先に登録"; o.value=""; p.appendChild(o); return;
-    }
-    state.members.forEach(m=>{
-      const o=document.createElement("option"); o.value=m.id; o.textContent=m.name; p.appendChild(o);
+    ["payer","receiptPayer"].forEach(pid=>{
+      const p=$(pid); if(!p) return;
+      const prev=p.value; p.innerHTML="";
+      if(!state.members.length){
+        const o=document.createElement("option"); o.textContent="参加者を先に登録"; o.value=""; p.appendChild(o); return;
+      }
+      state.members.forEach(m=>{
+        const o=document.createElement("option"); o.value=m.id; o.textContent=m.name; p.appendChild(o);
+      });
+      if(prev && state.members.some(m=>m.id===prev)) p.value=prev;
     });
   }
 
@@ -496,6 +521,386 @@
     return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   }
 
+  /* ===== Costco receipt parser (pure functions, no DOM) ===== */
+  function normalizeReceiptLine(s){
+    return String(s == null ? "" : s)
+      .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+      .replace(/，/g, ",").replace(/．/g, ".")
+      .replace(/[¥￥]/g, " ")
+      .replace(/\t/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  function parsePriceToken(tok){
+    if(tok == null) return null;
+    const t = String(tok).replace(/,/g, "");
+    if(!/^-?\d+$/.test(t)) return null;
+    const v = parseInt(t, 10);
+    return Number.isFinite(v) ? v : null;
+  }
+  // Extract the right-most price-like number from a line. Returns {price, before} or null.
+  function extractTrailingPrice(line){
+    const m = line.match(/^(.*?)(-?\d{1,3}(?:,\d{3})+|-?\d+)\s*[A-CEFNT]?\s*$/);
+    if(!m) return null;
+    const price = parsePriceToken(m[2]);
+    if(price === null) return null;
+    return { price: price, before: m[1].trim() };
+  }
+  const RECEIPT_NOISE_RE = /(COSTCO|WHOLESALE|ホールセール|会員|MEMBER|MEMBERSHIP|TEL|電話|領収書|RECEIPT|お預り|お預かり|預り金|お釣り|釣銭|CHANGE|CASH|クレジット|VISA|MASTER|AMEX|JCB|APPROVAL|承認番号|伝票番号|ありがとう|THANK YOU|営業時間|ご来店|再発行|返品|交換|WAREHOUSE|日本|〒|http)/i;
+  const RECEIPT_TOTAL_RE = /(合計|TOTAL(?!.*DEPT)|GRAND TOTAL)/i;
+  const RECEIPT_SUBTOTAL_RE = /(小計|SUBTOTAL|SUB TOTAL)/i;
+  const RECEIPT_TAX_RE = /(消費税|税額|TAX)/i;
+  const RECEIPT_COUNT_RE = /(購入点数|商品点数|点数|ITEMS?\s+SOLD|ITEM COUNT)/i;
+  function isCodeItemLine(l){ return /^\s*\d{4,7}\s+/.test(l); }
+
+  // lines: array of strings, or array of {text, confidence}
+  function parseCostcoReceipt(lines){
+    const norm = (lines || []).map(l => {
+      if(typeof l === "string") return { text: normalizeReceiptLine(l), confidence: null };
+      return { text: normalizeReceiptLine(l && l.text), confidence: (l && typeof l.confidence === "number") ? l.confidence : null };
+    }).filter(l => l.text.length > 0);
+
+    const items = [];
+    let detectedTotal = null, detectedSubtotal = null, detectedTax = null, detectedCount = null;
+    let pending = null; // item line that had a code/name but no price yet
+
+    function pushItem(it){ items.push(it); }
+
+    for(let i = 0; i < norm.length; i++){
+      const line = norm[i].text;
+      const conf = norm[i].confidence;
+      const upper = line.toUpperCase();
+
+      // Quantity detail line for the previous item, e.g. "2 @ 649" or "2 x 649 1,298"
+      const qtyDetail = line.match(/^(\d{1,3})\s*[@xX×]\s*(-?[\d,]+)(?:\s+(-?[\d,]+))?\s*[A-CEFNT]?\s*$/);
+      if(qtyDetail && items.length && !RECEIPT_TOTAL_RE.test(line)){
+        const prev = items[items.length - 1];
+        const q = parseInt(qtyDetail[1], 10);
+        const unit = parsePriceToken(qtyDetail[2]);
+        if(q > 0 && unit !== null){
+          prev.qty = q; prev.unitPrice = unit;
+          prev.amount = qtyDetail[3] != null ? (parsePriceToken(qtyDetail[3]) != null ? parsePriceToken(qtyDetail[3]) : unit * q) : unit * q;
+        }
+        continue;
+      }
+
+      const trailing = extractTrailingPrice(line);
+
+      // Totals / subtotal / tax / count lines (checked before generic noise)
+      if(RECEIPT_SUBTOTAL_RE.test(line)){
+        if(trailing) detectedSubtotal = trailing.price;
+        continue;
+      }
+      if(RECEIPT_TOTAL_RE.test(line) && !/小計/.test(line)){
+        if(trailing) detectedTotal = trailing.price;
+        continue;
+      }
+      if(RECEIPT_TAX_RE.test(line) && !isCodeItemLine(line)){
+        if(trailing) detectedTax = trailing.price;
+        continue;
+      }
+      if(RECEIPT_COUNT_RE.test(line)){
+        const cm = line.match(/(\d{1,4})\s*(?:点|個|ITEMS?)?\s*$/i);
+        if(cm) detectedCount = parseInt(cm[1], 10);
+        continue;
+      }
+      if(RECEIPT_NOISE_RE.test(line) && !/^\s*\d{4,7}\s+/.test(line)) continue;
+      // Date / time only lines
+      if(/^\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}/.test(line) || /^\d{1,2}:\d{2}/.test(line)) continue;
+
+      if(!trailing){
+        // Code + name but no price: remember and merge with the next priced line
+        const codeOnly = line.match(/^[\*#]*\s*(\d{4,7})\s+(.+)$/);
+        if(codeOnly){
+          pending = { code: codeOnly[1], name: codeOnly[2].trim(), confidence: conf };
+        } else if(pending && line.length >= 2 && !RECEIPT_NOISE_RE.test(line)){
+          pending.name = (pending.name + " " + line).trim();
+        }
+        continue;
+      }
+
+      // A priced line. Work on the part before the price.
+      let before = trailing.before;
+      let price = trailing.price;
+
+      // Discount / coupon line: negative price, or wording that marks a discount
+      const isDiscount = price < 0 || /(\/\s*\d{4,7}|割引|値引|クーポン|COUPON|DISCOUNT|プロモーション)/i.test(before);
+      if(isDiscount && items.length){
+        const prev = items[items.length - 1];
+        const d = Math.abs(price);
+        prev.discount = (prev.discount || 0) + d;
+        prev.amount = prev.amount - d;
+        if(prev.qty > 0) prev.unitPrice = Math.round(prev.amount / prev.qty);
+        prev.lowConfidence = true;
+        continue;
+      }
+      if(isDiscount && !items.length) continue; // stray discount with nothing to attach to
+
+      // Code + name
+      let code = null, name = before;
+      const codeMatch = before.match(/^[\*#]*\s*(\d{4,7})\s+(.+)$/);
+      if(codeMatch){ code = codeMatch[1]; name = codeMatch[2].trim(); }
+      else if(pending){ code = pending.code; name = (pending.name + " " + before).trim(); pending = null; }
+
+      name = name.replace(/^[\*#\s]+/, "").replace(/\s+[\*#]+$/, "").trim();
+      // Too-short or purely numeric names are not items
+      if(!name || /^[\d\s.,-]+$/.test(name)) continue;
+      // Names that are clearly totals/tax labels slipped through
+      if(RECEIPT_TOTAL_RE.test(name) || RECEIPT_SUBTOTAL_RE.test(name)) continue;
+
+      let qty = 1, unitPrice = price;
+      // Quantity embedded at the end of the name, e.g. "KS WATER 500ML X12" is a pack, not qty — only
+      // treat an explicit "N @ price" / "N個" suffix as quantity.
+      const qtySuffix = name.match(/^(.*?)\s+(\d{1,3})\s*個\s*$/);
+      if(qtySuffix){ name = qtySuffix[1].trim(); qty = parseInt(qtySuffix[2], 10); if(qty > 0) unitPrice = Math.round(price / qty); }
+
+      const lowConfidence = (conf !== null && conf < 70) || !code;
+      pushItem({
+        code: code, name: name, qty: qty, unitPrice: unitPrice,
+        amount: price, discount: 0, confidence: conf, lowConfidence: lowConfidence
+      });
+    }
+
+    const itemsTotal = items.reduce((a, it) => a + it.amount, 0);
+    return {
+      items: items,
+      detectedTotal: detectedTotal,
+      detectedSubtotal: detectedSubtotal,
+      detectedTax: detectedTax,
+      detectedCount: detectedCount,
+      itemsTotal: itemsTotal
+    };
+  }
+
+  /* ===== Receipt reading UI (DOM) ===== */
+  let receiptCandidates = [];
+  let receiptDetected = { total: null, subtotal: null, count: null };
+
+  function loadTesseractLib(){
+    if(window.Tesseract) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("読み取り機能を読み込めませんでした。通信状態を確認してください。"));
+      document.head.appendChild(s);
+    });
+  }
+
+  function fileToImage(file){
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => { resolve({ img: img, url: url }); };
+      img.onerror = e => { URL.revokeObjectURL(url); reject(e); };
+      img.src = url;
+    });
+  }
+
+  // Scale + grayscale + contrast, done with pixels so it works on iOS Safari too.
+  function preprocessCanvas(img){
+    const maxW = 2200;
+    const scale = Math.min(1, maxW / img.naturalWidth) || 1;
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, w, h);
+    try {
+      const data = ctx.getImageData(0, 0, w, h);
+      const px = data.data;
+      for(let i = 0; i < px.length; i += 4){
+        let g = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+        g = (g - 128) * 1.45 + 128;
+        g = g < 0 ? 0 : (g > 255 ? 255 : g);
+        px[i] = px[i + 1] = px[i + 2] = g;
+      }
+      ctx.putImageData(data, 0, 0);
+    } catch(e) { /* if pixel access fails, OCR the plain image */ }
+    return canvas;
+  }
+
+  function sliceCanvas(source, y, height){
+    const c = document.createElement("canvas");
+    c.width = source.width; c.height = height;
+    c.getContext("2d").drawImage(source, 0, y, source.width, height, 0, 0, source.width, height);
+    return c;
+  }
+
+  async function ocrCanvasInChunks(canvas, onProgress){
+    const chunkH = 1400, overlap = 180;
+    const lines = [];
+    let y = 0, idx = 0;
+    const totalChunks = Math.max(1, Math.ceil((canvas.height - overlap) / (chunkH - overlap)));
+    while(y < canvas.height){
+      const h = Math.min(chunkH, canvas.height - y);
+      const part = (h === canvas.height) ? canvas : sliceCanvas(canvas, y, h);
+      const result = await Tesseract.recognize(part, "eng", {
+        logger: m => {
+          if(m.status === "recognizing text" && onProgress){
+            onProgress(idx, totalChunks, m.progress || 0);
+          }
+        }
+      });
+      const data = result.data || {};
+      let chunkLines = [];
+      if(Array.isArray(data.lines) && data.lines.length){
+        chunkLines = data.lines
+          .filter(l => l && l.text && l.text.trim())
+          .map(l => ({ text: l.text, confidence: typeof l.confidence === "number" ? l.confidence : null }));
+      } else if(data.text){
+        chunkLines = data.text.split(/\n/).filter(t => t.trim()).map(t => ({ text: t, confidence: null }));
+      }
+      // Drop near-duplicates produced in the overlap with the previous chunk
+      for(const cl of chunkLines){
+        const key = normalizeReceiptLine(cl.text).replace(/\s+/g, "");
+        const isDup = lines.length && lines.slice(-4).some(p => p._key === key);
+        if(!isDup) lines.push({ text: cl.text, confidence: cl.confidence, _key: key });
+      }
+      idx++;
+      if(y + h >= canvas.height) break;
+      y += (chunkH - overlap);
+    }
+    return lines.map(l => ({ text: l.text, confidence: l.confidence }));
+  }
+
+  function renderReceiptCandidates(){
+    const box = $("receiptCandidates");
+    box.innerHTML = "";
+    const summary = $("receiptSummary");
+    if(!receiptCandidates.length){
+      summary.textContent = "";
+      $("registerReceiptBtn").style.display = "none";
+      return;
+    }
+    receiptCandidates.forEach((it, idx) => {
+      const row = document.createElement("div");
+      row.className = "item";
+      const top = document.createElement("div");
+      top.style.display = "flex"; top.style.gap = "8px"; top.style.alignItems = "center";
+
+      const chk = document.createElement("input");
+      chk.type = "checkbox"; chk.checked = it.include !== false;
+      chk.style.width = "22px"; chk.style.height = "22px"; chk.style.flex = "0 0 auto";
+      chk.addEventListener("change", () => { it.include = chk.checked; renderReceiptSummary(); });
+
+      const name = document.createElement("input");
+      name.value = it.name; name.placeholder = "商品名"; name.style.flex = "1";
+      name.addEventListener("input", () => { it.name = name.value; });
+
+      const del = document.createElement("button");
+      del.type = "button"; del.className = "btn small danger"; del.textContent = "削除"; del.style.flex = "0 0 auto";
+      del.addEventListener("click", () => { receiptCandidates.splice(idx, 1); renderReceiptCandidates(); });
+
+      top.append(chk, name, del);
+      row.appendChild(top);
+
+      const meta = document.createElement("div");
+      meta.className = "row"; meta.style.marginTop = "8px";
+      const qtyWrap = document.createElement("div");
+      const qtyLabel = document.createElement("label"); qtyLabel.textContent = "個数";
+      const qty = document.createElement("input");
+      qty.type = "number"; qty.inputMode = "decimal"; qty.min = "0.01"; qty.step = "0.01"; qty.value = it.qty;
+      qty.addEventListener("input", () => { it.qty = Number(qty.value) || 0; it.amount = Math.round(it.qty * it.unitPrice); renderReceiptSummary(); });
+      qtyWrap.append(qtyLabel, qty);
+
+      const priceWrap = document.createElement("div");
+      const priceLabel = document.createElement("label"); priceLabel.textContent = "単価";
+      const price = document.createElement("input");
+      price.type = "number"; price.inputMode = "numeric"; price.min = "0"; price.step = "1"; price.value = it.unitPrice;
+      price.addEventListener("input", () => { it.unitPrice = Number(price.value) || 0; it.amount = Math.round(it.qty * it.unitPrice); renderReceiptSummary(); });
+      priceWrap.append(priceLabel, price);
+      meta.append(qtyWrap, priceWrap);
+      row.appendChild(meta);
+
+      const notes = [];
+      if(it.code) notes.push("コード " + it.code);
+      if(it.discount) notes.push("値引き -" + fmt(it.discount) + " 込み");
+      if(it.lowConfidence) notes.push("⚠ 要確認：読み取りの自信が低い行です");
+      if(notes.length){
+        const n = document.createElement("div");
+        n.className = "itemmeta"; n.style.marginTop = "6px"; n.textContent = notes.join(" ・ ");
+        row.appendChild(n);
+      }
+      box.appendChild(row);
+    });
+    $("registerReceiptBtn").style.display = "";
+    renderReceiptSummary();
+  }
+
+  function renderReceiptSummary(){
+    const summary = $("receiptSummary");
+    if(!receiptCandidates.length){ summary.textContent = ""; return; }
+    const included = receiptCandidates.filter(it => it.include !== false);
+    const sum = included.reduce((a, it) => a + Math.round((Number(it.qty) || 0) * (Number(it.unitPrice) || 0)), 0);
+    let msg = "登録候補 " + included.length + "件 ・ 合計 " + fmt(sum);
+    const target = receiptDetected.total != null ? receiptDetected.total : receiptDetected.subtotal;
+    if(target != null){
+      const diff = sum - target;
+      msg += " ／ レシートの合計 " + fmt(target);
+      msg += diff === 0 ? " ／ ✓ 一致しました" : " ／ ⚠ 差額 " + fmt(diff) + " あります。行の抜けや金額ミスを確認してください";
+    }
+    if(receiptDetected.count != null && receiptDetected.count !== included.length){
+      msg += " ／ レシートの点数は " + receiptDetected.count + "点です";
+    }
+    summary.textContent = msg;
+  }
+
+  async function readReceiptPhoto(){
+    const fileInput = $("receiptPhoto");
+    const status = $("receiptStatus");
+    const file = fileInput.files && fileInput.files[0];
+    if(!file){ status.textContent = "先にレシート写真を選んでください。"; return; }
+    const btn = $("readReceipt");
+    btn.disabled = true;
+    status.textContent = "読み取り準備中です。初回は少し時間がかかります。";
+    try {
+      await loadTesseractLib();
+      const loaded = await fileToImage(file);
+      const canvas = preprocessCanvas(loaded.img);
+      URL.revokeObjectURL(loaded.url);
+      const lines = await ocrCanvasInChunks(canvas, (i, n, p) => {
+        status.textContent = "読み取り中… " + (i + 1) + "/" + n + " 部分 ・ " + Math.round(p * 100) + "%";
+      });
+      const parsed = parseCostcoReceipt(lines);
+      receiptCandidates = parsed.items.map(it => ({ ...it, include: true }));
+      receiptDetected = { total: parsed.detectedTotal, subtotal: parsed.detectedSubtotal, count: parsed.detectedCount };
+      $("receiptRawText").value = lines.map(l => l.text).join("\n");
+      renderReceiptCandidates();
+      status.textContent = receiptCandidates.length
+        ? "読み取りが完了しました。内容を確認・修正してから「まとめて登録」を押してください。"
+        : "商品らしい行が見つかりませんでした。写真を明るい場所で、レシート全体が入るように撮り直してみてください。下の「読み取った文字」で中身を確認できます。";
+    } catch(e) {
+      status.textContent = "エラー：" + (e && e.message ? e.message : "読み取りに失敗しました");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function registerReceiptItems(){
+    if(state.members.length < 1){ toast("参加者を先に登録してください"); navTo("members"); return; }
+    const payerId = $("receiptPayer").value || $("payer").value;
+    if(!payerId){ toast("支払った人を選んでください"); return; }
+    const included = receiptCandidates.filter(it => it.include !== false && String(it.name || "").trim() && Number(it.qty) > 0 && Number(it.unitPrice) >= 0);
+    if(!included.length){ toast("登録する商品がありません"); return; }
+    const share = 1 / state.members.length;
+    const shares = {};
+    state.members.forEach(m => { shares[m.id] = share; });
+    included.forEach(it => {
+      const qty = Number(it.qty), unitPrice = Number(it.unitPrice);
+      state.items.push({
+        id: uid(), name: String(it.name).trim(), qty: qty, unitPrice: unitPrice,
+        amount: Math.round(qty * unitPrice), payerId: payerId, shares: { ...shares }
+      });
+    });
+    save(); renderItems(); renderSettle();
+    receiptCandidates = [];
+    renderReceiptCandidates();
+    $("receiptStatus").textContent = "";
+    toast(included.length + "件の商品を登録しました");
+  }
+
   document.addEventListener("DOMContentLoaded",()=>{
     load();loadHistory();
     $("historyDate").value=today();
@@ -506,6 +911,8 @@
     $("addMemberBtn").addEventListener("click",addMember);
     $("memberName").addEventListener("keydown",e=>{if(e.key==="Enter")addMember();});
     $("addItemBtn").addEventListener("click",addItem);
+    $("readReceipt").addEventListener("click",readReceiptPhoto);
+    $("registerReceiptBtn").addEventListener("click",registerReceiptItems);
     $("resetBtn").addEventListener("click",resetAll);
     document.querySelectorAll("#modeSeg button").forEach(b=>b.addEventListener("click",()=>{
       state.mode=b.dataset.mode;
@@ -517,278 +924,6 @@
     if(modeBtn){document.querySelectorAll("#modeSeg button").forEach(x=>x.classList.toggle("active",x===modeBtn));}
   });
 })();
-</script>
-  <script>
-
-(function () {
-
-  const page = document.getElementById("page-items");
-
-  if (!page || document.getElementById("receiptReader")) return;
-
-  const box = document.createElement("div");
-
-  box.className = "card";
-
-  box.id = "receiptReader";
-
-  box.innerHTML = `
-
-    <h2>🧾 レシート読み取り</h2>
-
-    <p class="notice">レシート写真を選んで商品名や金額を読み取ります。読み取り結果は確認してから登録してください。</p>
-
-    <input id="receiptPhoto" type="file" accept="image/*" capture="environment">
-
-    <button id="readReceipt" class="btn primary" style="width:100%;margin-top:10px">写真を読み取る</button>
-
-    <p id="receiptStatus" class="notice"></p>
-
-    <div id="receiptOutput"></div>
-
-  `;
-
-  page.insertBefore(box, page.firstChild);
-
-  document.getElementById("readReceipt").addEventListener("click", async function () {
-
-    const file = document.getElementById("receiptPhoto").files[0];
-
-    const status = document.getElementById("receiptStatus");
-
-    const output = document.getElementById("receiptOutput");
-
-    if (!file) {
-
-      status.textContent = "先にレシート写真を選んでください。";
-
-      return;
-
-    }
-
-    this.disabled = true;
-
-    status.textContent = "読み取り準備中です。初回は時間がかかる場合があります。";
-
-    output.replaceChildren();
-
-    try {
-
-      if (!window.Tesseract) {
-
-        await new Promise((resolve, reject) => {
-
-          const s = document.createElement("script");
-
-          s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
-
-          s.onload = resolve;
-
-          s.onerror = () => reject(new Error("読み取り機能を読み込めません。通信を確認してください。"));
-
-          document.head.appendChild(s);
-
-        });
-
-      }
-
-      const result = await Tesseract.recognize(file, "jpn+eng", {
-
-        logger: m => {
-
-          if (m.status === "recognizing text") {
-
-            status.textContent = "読み取り中… " + Math.round(m.progress * 100) + "%";
-
-          }
-
-        }
-
-      });
-
-      const text = result.data.text || "";
-
-      const area = document.createElement("textarea");
-
-      area.value = text;
-
-      area.rows = 10;
-
-      area.style.width = "100%";
-
-      area.style.marginTop = "12px";
-
-      area.placeholder = "読み取った文字がここに表示されます";
-
-      output.appendChild(area);
-
-      const note = document.createElement("p");
-
-      note.className = "notice";
-
-      note.textContent = "読み取り結果です。商品名や金額が正しいか確認してください。";
-
-      output.prepend(note);
-
-      status.textContent = "読み取りが完了しました。";
-
-    } catch (e) {
-
-      status.textContent = "エラー：" + e.message;
-
-    } finally {
-
-      this.disabled = false;
-
-    }
-
-  });
-
-})();
-
-</script>
-  
-
-<script>
-
-document.addEventListener("click", async function (event) {
-
-  const button = event.target.closest("#readReceipt");
-
-  if (!button) return;
-
-  event.preventDefault();
-
-  event.stopImmediatePropagation();
-
-  const card = button.closest("div");
-
-  let area = card;
-
-  while (
-
-    area &&
-
-    (!area.querySelector('input[type="file"]') ||
-
-     !area.querySelector("textarea"))
-
-  ) {
-
-    area = area.parentElement;
-
-  }
-
-  if (!area) {
-
-    alert("レシート画像欄を確認できませんでした。");
-
-    return;
-
-  }
-
-  const fileInput = area.querySelector('input[type="file"]');
-
-  const output = area.querySelector("textarea");
-
-  const file = fileInput.files && fileInput.files[0];
-
-  if (!file) {
-
-    alert("先にレシート画像を選択してください。");
-
-    return;
-
-  }
-
-  if (!window.Tesseract) {
-
-    alert("読み取り機能の準備ができていません。ページを再読み込みしてください。");
-
-    return;
-
-  }
-
-  button.disabled = true;
-
-  output.value = "画像を調整して読み取り中です。少しお待ちください。";
-
-  try {
-
-    const image = new Image();
-
-    const imageURL = URL.createObjectURL(file);
-
-    await new Promise((resolve, reject) => {
-
-      image.onload = resolve;
-
-      image.onerror = reject;
-
-      image.src = imageURL;
-
-    });
-
-    const scale = Math.min(
-
-      3,
-
-      Math.max(2, 2400 / image.width)
-
-    );
-
-    const canvas = document.createElement("canvas");
-
-    canvas.width = Math.round(image.width * scale);
-
-    canvas.height = Math.round(image.height * scale);
-
-    const ctx = canvas.getContext("2d");
-
-    ctx.filter = "grayscale(1) contrast(1.6)";
-
-    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-
-    URL.revokeObjectURL(imageURL);
-
-    const result = await Tesseract.recognize(
-
-      canvas,
-
-      "jpn+eng",
-
-      { logger: function (m) {
-
-        if (m.status === "recognizing text") {
-
-          output.value =
-
-            "読み取り中… " +
-
-            Math.round((m.progress || 0) * 100) + "%";
-
-        }
-
-      }}
-
-    );
-
-    output.value = result.data.text;
-
-  } catch (error) {
-
-    output.value = "読み取りに失敗しました。画像を選び直してお試しください。";
-
-    console.error(error);
-
-  } finally {
-
-    button.disabled = false;
-
-  }
-
-}, true);
-
 </script>
 </body>
 </html>
